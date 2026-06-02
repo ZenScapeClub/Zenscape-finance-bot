@@ -472,6 +472,16 @@ async def contractor_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("Комментарий (опционально, напиши или нажми /skip):")
     return State.COMMENT
 
+async def contractor_skip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle skip contractor button"""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['contractor'] = ''
+    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_comment")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Комментарий:", reply_markup=reply_markup)
+    return State.COMMENT
+
 async def comment_skip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle skip comment button"""
     query = update.callback_query
