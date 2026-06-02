@@ -164,56 +164,120 @@ def create_project(name: str, plan_income: float = 0, plan_expense: float = 0):
         logger.error(f"Error creating project: {type(e).__name__}: {e}")
         return False
 
-def get_project_summary(project: str):
-    """Get summary for a project from Дашборд"""
+def _parse_num(val):
+    """Safely parse number from cell value"""
     try:
-        ws_obj = get_sheets().worksheet('Объекты')
-        projects = ws_obj.col_values(1)[2:]
-        
-        idx = None
-        for i, p in enumerate(projects):
-            if p and p.strip() == project:
-                idx = i + 3  # +3 because col_values is 0-indexed and starts at row 1, but we start at row 3
-                break
-        
-        if idx is None:
-            return None
-        
-        row = ws_obj.row_values(idx)
-        if len(row) < 12:
-            return None
-        
+        return float(str(val).replace(' ', '').replace(',', '.').replace(' ', '')) if val else 0.0
+    except:
+        return 0.0
+
+def _calc_margin(income, expense):
+    profit = income - expense
+    return profit / income if income > 0 else 0.0
+
+def get_operations_data():
+    """Read all operations from Операции sheet"""
+    try:
+        ws = get_sheets().worksheet('Операции')
+        rows = ws.get_all_values()[2:]  # skip title and header
+        ops = []
+        for row in rows:
+            if len(row) >= 6 and row[0]:  # has ID
+                ops.append({
+                    'id': row[0],
+                    'date': row[1],
+                    'project': row[2],
+                    'type': row[3],
+                    'category': row[4],
+                    'amount': _parse_num(row[5]),
+                    'contractor': row[6] if len(row) > 6 else '',
+                    'status': row[7] if len(row) > 7 else '',
+                    'comment': row[8] if len(row) > 8 else '',
+                })
+        return ops
+    except Exception as e:
+        logger.error(f"Error reading operations: {e}")
+        return []
+
+def get_project_plan(project: str):
+    """Get plan values from Объекты sheet"""
+    try:
+        ws = get_sheets().worksheet('Объекты')
+        rows = ws.get_all_values()[2:]
+        for row in rows:
+            if row and row[0].strip() == project:
+                return {
+                    'status': row[1] if len(row) > 1 else '',
+                    'plan_income': _parse_num(row[4]) if len(row) > 4 else 0,
+                    'plan_expense': _parse_num(row[5]) if len(row) > 5 else 0,
+                }
+        return {'status': 'Активный', 'plan_income': 0, 'plan_expense': 0}
+    except Exception as e:
+        logger.error(f"Error reading plan: {e}")
+        return {'status': '', 'plan_income': 0, 'plan_expense': 0}
+
+def get_project_summary(project: str):
+    """Calculate project summary from operations"""
+    try:
+        ops = get_operations_data()
+        proj_ops = [o for o in ops if o['project'] == project]
+        plan = get_project_plan(project)
+
+        fact_income = sum(o['amount'] for o in proj_ops if o['type'] == 'Приход')
+        fact_expense = sum(o['amount'] for o in proj_ops if o['type'] == 'Расход')
+        fact_profit = fact_income - fact_expense
+        fact_margin = fact_profit / fact_income if fact_income > 0 else 0.0
+
+        plan_income = plan['plan_income']
+        plan_expense = plan['plan_expense']
+        plan_profit = plan_income - plan_expense
+        plan_margin = plan_profit / plan_income if plan_income > 0 else 0.0
+
         return {
-            'name': row[0],
-            'status': row[1],
-            'plan_income': row[4],
-            'plan_expense': row[5],
-            'plan_margin': row[7],
-            'fact_income': row[8],
-            'fact_expense': row[9],
-            'fact_margin': row[11],
-            'dev_profit': row[14] if len(row) > 14 else 0
+            'name': project,
+            'status': plan['status'],
+            'plan_income': plan_income,
+            'plan_expense': plan_expense,
+            'plan_profit': plan_profit,
+            'plan_margin': plan_margin,
+            'fact_income': fact_income,
+            'fact_expense': fact_expense,
+            'fact_profit': fact_profit,
+            'fact_margin': fact_margin,
+            'dev_profit': fact_profit - plan_profit,
         }
     except Exception as e:
-        logger.error(f"Error getting project summary: {e}")
+        logger.error(f"Error in get_project_summary: {e}")
         return None
 
 def get_all_summary():
-    """Get summary from Дашборд sheet"""
+    """Calculate total summary from operations"""
     try:
-        ws = get_sheets().worksheet('Дашборд')
+        ops = get_operations_data()
+        fact_income = sum(o['amount'] for o in ops if o['type'] == 'Приход')
+        fact_expense = sum(o['amount'] for o in ops if o['type'] == 'Расход')
+        fact_profit = fact_income - fact_expense
+        fact_margin = fact_profit / fact_income if fact_income > 0 else 0.0
+
+        ws_obj = get_sheets().worksheet('Объекты')
+        rows = ws_obj.get_all_values()[2:]
+        plan_income = sum(_parse_num(r[4]) for r in rows if r and r[0] and len(r) > 4)
+        plan_expense = sum(_parse_num(r[5]) for r in rows if r and r[0] and len(r) > 5)
+        plan_profit = plan_income - plan_expense
+        plan_margin = plan_profit / plan_income if plan_income > 0 else 0.0
+
         return {
-            'fact_income': ws.cell(3, 2).value,
-            'fact_expense': ws.cell(4, 2).value,
-            'fact_profit': ws.cell(5, 2).value,
-            'fact_margin': ws.cell(6, 2).value,
-            'plan_income': ws.cell(8, 2).value,
-            'plan_expense': ws.cell(9, 2).value,
-            'plan_profit': ws.cell(10, 2).value,
-            'plan_margin': ws.cell(11, 2).value,
+            'fact_income': fact_income,
+            'fact_expense': fact_expense,
+            'fact_profit': fact_profit,
+            'fact_margin': fact_margin,
+            'plan_income': plan_income,
+            'plan_expense': plan_expense,
+            'plan_profit': plan_profit,
+            'plan_margin': plan_margin,
         }
     except Exception as e:
-        logger.error(f"Error getting summary: {e}")
+        logger.error(f"Error in get_all_summary: {e}")
         return None
 
 def export_to_csv(project: str = None):
@@ -270,24 +334,26 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'report_all':
         summary = get_all_summary()
         if summary:
-            fact_margin_pct = f"{float(summary['fact_margin'])*100:.1f}%" if summary['fact_margin'] else "—"
-            plan_margin_pct = f"{float(summary['plan_margin'])*100:.1f}%" if summary['plan_margin'] else "—"
+            def fmt(v):
+                try: return f"{float(v):,.0f}".replace(',', ' ')
+                except: return str(v) if v else "0"
+            def pct(v):
+                try: return f"{float(v)*100:.1f}%"
+                except: return "—"
             
-            text = f"""
-📊 <b>Общий отчёт</b>
-
-<b>ФАКТ:</b>
-💰 Доход: {summary['fact_income']} ₽
-💸 Расход: {summary['fact_expense']} ₽
-📈 Прибыль: {summary['fact_profit']} ₽
-📊 Маржа: {fact_margin_pct}
-
-<b>ПЛАН:</b>
-💰 Доход: {summary['plan_income']} ₽
-💸 Расход: {summary['plan_expense']} ₽
-📈 Прибыль: {summary['plan_profit']} ₽
-📊 Маржа: {plan_margin_pct}
-"""
+            text = (
+                "📊 <b>Общий отчёт</b>\n\n"
+                "<b>ФАКТ:</b>\n"
+                "💰 Доход: " + fmt(summary['fact_income']) + " ₽\n"
+                "💸 Расход: " + fmt(summary['fact_expense']) + " ₽\n"
+                "📈 Прибыль: " + fmt(summary['fact_profit']) + " ₽\n"
+                "📊 Маржа: " + pct(summary['fact_margin']) + "\n\n"
+                "<b>ПЛАН:</b>\n"
+                "💰 Доход: " + fmt(summary['plan_income']) + " ₽\n"
+                "💸 Расход: " + fmt(summary['plan_expense']) + " ₽\n"
+                "📈 Прибыль: " + fmt(summary['plan_profit']) + " ₽\n"
+                "📊 Маржа: " + pct(summary['plan_margin'])
+            )
             keyboard = [[InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
@@ -305,22 +371,27 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         project = query.data[7:]
         summary = get_project_summary(project)
         if summary:
-            fact_margin_pct = f"{float(summary['fact_margin'])*100:.1f}%" if summary['fact_margin'] else "—"
-            plan_margin_pct = f"{float(summary['plan_margin'])*100:.1f}%" if summary['plan_margin'] else "—"
+            def fmt(v):
+                try: return f"{float(v):,.0f}".replace(',', ' ')
+                except: return str(v) if v else "0"
+            def pct(v):
+                try: return f"{float(v)*100:.1f}%"
+                except: return "—"
             
-            text = f"""
-📊 <b>Отчёт: {summary['name']}</b>
-
-<b>ФАКТ:</b>
-💰 Доход: {summary['fact_income']} ₽
-💸 Расход: {summary['fact_expense']} ₽
-📊 Маржа: {fact_margin_pct}
-
-<b>ПЛАН:</b>
-💰 Доход: {summary['plan_income']} ₽
-💸 Расход: {summary['plan_expense']} ₽
-📊 Маржа: {plan_margin_pct}
-"""
+            text = (
+                "📊 <b>Отчёт: " + summary['name'] + "</b>\n\n"
+                "<b>ФАКТ:</b>\n"
+                "💰 Доход: " + fmt(summary['fact_income']) + " ₽\n"
+                "💸 Расход: " + fmt(summary['fact_expense']) + " ₽\n"
+                "📈 Прибыль: " + fmt(summary['fact_profit']) + " ₽\n"
+                "📊 Маржа: " + pct(summary['fact_margin']) + "\n\n"
+                "<b>ПЛАН:</b>\n"
+                "💰 Доход: " + fmt(summary['plan_income']) + " ₽\n"
+                "💸 Расход: " + fmt(summary['plan_expense']) + " ₽\n"
+                "📈 Прибыль: " + fmt(summary['plan_profit']) + " ₽\n"
+                "📊 Маржа: " + pct(summary['plan_margin']) + "\n"
+                "📉 Откл. прибыль: " + fmt(summary['dev_profit']) + " ₽"
+            )
             keyboard = [[InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
