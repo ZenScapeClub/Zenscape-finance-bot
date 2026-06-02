@@ -442,7 +442,9 @@ async def date_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "date_custom":
         await query.edit_message_text("Напиши дату в формате ДД.ММ.ГГГГ (например, 15.05.2026):")
         return State.DATE
-    await query.edit_message_text("📅 Дата: " + context.user_data["date"] + "\n\nКонтрагент (напиши или /skip):")
+    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_contractor")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("📅 Дата: " + context.user_data["date"] + "\n\nКонтрагент:", reply_markup=reply_markup)
     return State.CONTRACTOR
 
 async def date_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,7 +453,9 @@ async def date_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%d.%m.%Y")
         context.user_data["date"] = text
-        await update.message.reply_text("📅 Дата: " + text + "\n\nКонтрагент (напиши или /skip):")
+        keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_contractor")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("📅 Дата: " + text + "\n\nКонтрагент:", reply_markup=reply_markup)
         return State.CONTRACTOR
     except ValueError:
         await update.message.reply_text("❌ Формат неверный. Напиши ДД.ММ.ГГГГ (например, 15.05.2026):")
@@ -468,13 +472,29 @@ async def contractor_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("Комментарий (опционально, напиши или нажми /skip):")
     return State.COMMENT
 
+async def comment_skip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle skip comment button"""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['comment'] = ''
+    return await save_operation(update, context, via_query=True)
+
 async def comment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle comment and save operation"""
-    text = update.message.text.strip()
-    if text.lower() == '/skip':
-        context.user_data['comment'] = ''
-    else:
-        context.user_data['comment'] = text
+    context.user_data['comment'] = update.message.text.strip()
+    
+    return await save_operation(update, context, via_query=False)
+
+async def save_operation(update, context, via_query=False):
+    """Save operation and show result"""
+    keyboard = [
+        [InlineKeyboardButton("➕ Новая операция", callback_data='op_new')],
+        [InlineKeyboardButton("📊 Отчет по всем", callback_data='report_all')],
+        [InlineKeyboardButton("🏢 По объекту", callback_data='report_object')],
+        [InlineKeyboardButton("📁 Создать объект", callback_data='create_project')],
+        [InlineKeyboardButton("📥 Выгрузить CSV", callback_data='export')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     if add_operation(
         context.user_data['project'],
@@ -485,26 +505,15 @@ async def comment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.get('comment', ''),
         context.user_data.get('date', '')
     ):
-        await update.message.reply_text(
-            f"""✅ Операция сохранена!
-            
-📍 Объект: {context.user_data['project']}
-📌 Тип: {context.user_data['op_type']}
-🏷 Категория: {context.user_data['category']}
-💰 Сумма: {context.user_data['amount']} ₽"""
-        )
+        text = ("✅ Операция сохранена!\n\n📍 Объект: " + context.user_data['project'] + "\n📌 Тип: " + context.user_data['op_type'] + "\n🏷 Категория: " + context.user_data['category'] + "\n💰 Сумма: " + str(context.user_data['amount']) + " ₽")
     else:
-        await update.message.reply_text("❌ Ошибка при сохранении операции.")
+        text = "❌ Ошибка при сохранении операции."
     
-    keyboard = [
-        [InlineKeyboardButton("➕ Новая операция", callback_data='op_new')],
-        [InlineKeyboardButton("📊 Отчет по всем", callback_data='report_all')],
-        [InlineKeyboardButton("🏢 По объекту", callback_data='report_object')],
-        [InlineKeyboardButton("📁 Создать объект", callback_data='create_project')],
-        [InlineKeyboardButton("📥 Выгрузить CSV", callback_data='export')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Что дальше?", reply_markup=reply_markup)
+    if via_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text)
+        await update.message.reply_text("Что дальше?", reply_markup=reply_markup)
     return State.MENU
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -528,8 +537,8 @@ def main():
             State.CATEGORY: [CallbackQueryHandler(menu_callback)],
             State.AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_handler)],
             State.DATE: [CallbackQueryHandler(date_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, date_text_handler)],
-            State.CONTRACTOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, contractor_handler)],
-            State.COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment_handler)],
+            State.CONTRACTOR: [CallbackQueryHandler(contractor_skip_handler, pattern='^skip_contractor$'), MessageHandler(filters.TEXT & ~filters.COMMAND, contractor_handler)],
+            State.COMMENT: [CallbackQueryHandler(comment_skip_handler, pattern='^skip_comment$'), MessageHandler(filters.TEXT & ~filters.COMMAND, comment_handler)],
             State.CREATE_PROJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_project_handler)],
         },
         fallbacks=[CommandHandler('cancel', cancel), CommandHandler('start', start)],
