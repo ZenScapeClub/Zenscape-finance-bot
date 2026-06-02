@@ -415,7 +415,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         csv_data = export_to_csv(project)
         if csv_data:
             filename = f"export_{project}.csv" if project else "export_all.csv"
-            await query.edit_message_text(f"✅ Готово. Файл: {filename}\n\n```{csv_data[:500]}...```", parse_mode=ParseMode.MARKDOWN)
+            bio = io.BytesIO(csv_data.encode('utf-8-sig'))
+            bio.name = filename
+            await query.message.reply_document(document=bio, filename=filename, caption="✅ Выгрузка готова")
+            await query.edit_message_text("✅ Файл отправлен выше.")
         return State.MENU
     
     elif query.data == 'back_to_menu':
