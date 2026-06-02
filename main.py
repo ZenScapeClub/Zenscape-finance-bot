@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+import base64
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -27,17 +28,18 @@ class State(Enum):
     OP_TYPE = 3
     CATEGORY = 4
     AMOUNT = 5
-    CONTRACTOR = 6
-    COMMENT = 7
-    CREATE_PROJECT = 8
+    DATE = 6
+    CONTRACTOR = 7
+    COMMENT = 8
+    CREATE_PROJECT = 9
 
 # Initialize Sheets API
 def init_sheets():
-    service_account_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+    service_account_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_B64')
     if not service_account_json:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON env var not set")
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_B64 env var not set")
     
-    service_account = json.loads(service_account_json)
+    service_account = json.loads(base64.b64decode(service_account_json).decode())
     creds = Credentials.from_service_account_info(
         service_account,
         scopes=['https://www.googleapis.com/auth/spreadsheets']
@@ -55,7 +57,49 @@ def get_sheets():
     global sheets
     if sheets is None:
         sheets = init_sheets()
+        setup_sheets(sheets)
     return sheets
+
+def setup_sheets(spreadsheet):
+    """Create required worksheets and headers if they don't exist"""
+    existing = [ws.title for ws in spreadsheet.worksheets()]
+    
+    if 'Объекты' not in existing:
+        ws = spreadsheet.add_worksheet('Объекты', rows=100, cols=15)
+        ws.update('A1', [['ZenScape — Объекты']])
+        ws.update('A2:O2', [['Название объекта', 'Статус', 'Дата начала', 'Адрес / Описание',
+                             'План доход', 'План расход', 'План прибыль', 'План маржа',
+                             'Факт доход', 'Факт расход', 'Факт прибыль', 'Факт маржа',
+                             'Откл. доход', 'Откл. расход', 'Откл. прибыль']])
+        logger.info("Created sheet: Объекты")
+    
+    if 'Операции' not in existing:
+        ws = spreadsheet.add_worksheet('Операции', rows=1000, cols=9)
+        ws.update('A1', [['ZenScape — Операции']])
+        ws.update('A2:I2', [['ID', 'Дата', 'Объект', 'Тип', 'Категория',
+                             'Сумма', 'Контрагент', 'Статус оплаты', 'Комментарий']])
+        logger.info("Created sheet: Операции")
+    
+    if 'Дашборд' not in existing:
+        ws = spreadsheet.add_worksheet('Дашборд', rows=100, cols=12)
+        ws.update('A1', [['ZenScape — Финансовый дашборд']])
+        logger.info("Created sheet: Дашборд")
+    
+    if 'Cash Flow' not in existing:
+        ws = spreadsheet.add_worksheet('Cash Flow', rows=10, cols=26)
+        logger.info("Created sheet: Cash Flow")
+    
+    if 'Категории' not in existing:
+        ws = spreadsheet.add_worksheet('Категории', rows=10, cols=2)
+        ws.update('A1:B1', [['Категория расхода', 'Категория дохода']])
+        logger.info("Created sheet: Категории")
+    
+    # Remove default Sheet1 if it exists and our sheets are there
+    if 'Sheet1' in existing and 'Объекты' in [ws.title for ws in spreadsheet.worksheets()]:
+        try:
+            spreadsheet.del_worksheet(spreadsheet.worksheet('Sheet1'))
+        except Exception:
+            pass
 
 # Helper functions
 def get_projects():
@@ -68,7 +112,7 @@ def get_projects():
         logger.error(f"Error getting projects: {e}")
         return []
 
-def add_operation(project: str, op_type: str, category: str, amount: float, contractor: str = "", comment: str = ""):
+def add_operation(project: str, op_type: str, category: str, amount: float, contractor: str = "", comment: str = "", date: str = ""):
     """Add operation to Операции sheet"""
     try:
         ws = get_sheets().worksheet('Операции')
@@ -80,7 +124,7 @@ def add_operation(project: str, op_type: str, category: str, amount: float, cont
         
         ws.append_row([
             next_id,
-            datetime.now().strftime('%d.%m.%Y'),
+            date if date else datetime.now().strftime('%d.%m.%Y'),
             project,
             op_type,
             category,
@@ -101,7 +145,7 @@ def create_project(name: str, plan_income: float = 0, plan_expense: float = 0):
         ws.append_row([
             name,
             'Активный',
-            datetime.now().strftime('%d.%m.%Y'),
+            date if date else datetime.now().strftime('%d.%m.%Y'),
             '',
             plan_income,
             plan_expense,
@@ -117,7 +161,7 @@ def create_project(name: str, plan_income: float = 0, plan_expense: float = 0):
         ])
         return True
     except Exception as e:
-        logger.error(f"Error creating project: {e}")
+        logger.error(f"Error creating project: {type(e).__name__}: {e}")
         return False
 
 def get_project_summary(project: str):
@@ -367,13 +411,51 @@ async def create_project_handler(update: Update, context: ContextTypes.DEFAULT_T
 async def amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle amount input"""
     try:
-        amount = float(update.message.text.strip())
+        amount = float(update.message.text.strip().replace(",", ".").replace(" ", ""))
         context.user_data['amount'] = amount
-        await update.message.reply_text("Контрагент (опционально, напиши или нажми /skip):")
-        return State.CONTRACTOR
+        from datetime import timedelta
+        today = datetime.now()
+        yesterday = today - timedelta(days=1)
+        keyboard = [
+            [InlineKeyboardButton(f"📅 Сегодня ({today.strftime('%d.%m')})", callback_data="date_today")],
+            [InlineKeyboardButton(f"📅 Вчера ({yesterday.strftime('%d.%m')})", callback_data="date_yesterday")],
+            [InlineKeyboardButton("✏️ Своя дата", callback_data="date_custom")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Дата операции:", reply_markup=reply_markup)
+        return State.DATE
     except ValueError:
         await update.message.reply_text("❌ Напиши число (например, 15000)")
         return State.AMOUNT
+
+async def date_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle date selection via buttons"""
+    query = update.callback_query
+    await query.answer()
+    from datetime import timedelta
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    if query.data == "date_today":
+        context.user_data["date"] = today.strftime("%d.%m.%Y")
+    elif query.data == "date_yesterday":
+        context.user_data["date"] = yesterday.strftime("%d.%m.%Y")
+    elif query.data == "date_custom":
+        await query.edit_message_text("Напиши дату в формате ДД.ММ.ГГГГ (например, 15.05.2026):")
+        return State.DATE
+    await query.edit_message_text("📅 Дата: " + context.user_data["date"] + "\n\nКонтрагент (напиши или /skip):")
+    return State.CONTRACTOR
+
+async def date_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle manual date input"""
+    text = update.message.text.strip()
+    try:
+        datetime.strptime(text, "%d.%m.%Y")
+        context.user_data["date"] = text
+        await update.message.reply_text("📅 Дата: " + text + "\n\nКонтрагент (напиши или /skip):")
+        return State.CONTRACTOR
+    except ValueError:
+        await update.message.reply_text("❌ Формат неверный. Напиши ДД.ММ.ГГГГ (например, 15.05.2026):")
+        return State.DATE
 
 async def contractor_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle contractor input"""
@@ -400,7 +482,8 @@ async def comment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['category'],
         context.user_data['amount'],
         context.user_data.get('contractor', ''),
-        context.user_data.get('comment', '')
+        context.user_data.get('comment', ''),
+        context.user_data.get('date', '')
     ):
         await update.message.reply_text(
             f"""✅ Операция сохранена!
@@ -444,6 +527,7 @@ def main():
             State.OP_TYPE: [CallbackQueryHandler(menu_callback)],
             State.CATEGORY: [CallbackQueryHandler(menu_callback)],
             State.AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount_handler)],
+            State.DATE: [CallbackQueryHandler(date_handler), MessageHandler(filters.TEXT & ~filters.COMMAND, date_text_handler)],
             State.CONTRACTOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, contractor_handler)],
             State.COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, comment_handler)],
             State.CREATE_PROJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_project_handler)],
