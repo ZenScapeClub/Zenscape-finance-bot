@@ -1,4 +1,4 @@
-import os, json, csv, io, base64, logging
+import os, json, csv, io, base64, logging, tempfile
 from datetime import datetime, timedelta
 from enum import Enum
 
@@ -12,46 +12,89 @@ from google.oauth2.service_account import Credentials
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-ALLOWED_USERS = {257170336}
+# ── Access control ────────────────────────────────────────────────────────────
 
-def restricted(func):
+def _parse_ids(env_var, fallback=''):
+    val = os.environ.get(env_var, fallback)
+    return {int(x.strip()) for x in val.split(',') if x.strip().isdigit()}
+
+ADMIN_USERS  = _parse_ids('ALLOWED_USERS', '257170336')
+VIEWER_USERS = _parse_ids('VIEWER_USERS')
+
+def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in ALLOWED_USERS:
+        uid = update.effective_user.id
+        if uid not in ADMIN_USERS:
             await update.effective_message.reply_text("Нет доступа.")
             return
         return await func(update, context)
     wrapper.__name__ = func.__name__
     return wrapper
 
+def any_user(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        if uid not in ADMIN_USERS and uid not in VIEWER_USERS:
+            await update.effective_message.reply_text("Нет доступа.")
+            return
+        return await func(update, context)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+def _is_admin(update: Update) -> bool:
+    return update.effective_user.id in ADMIN_USERS
+
+# ── States ────────────────────────────────────────────────────────────────────
+
 class S(Enum):
     MENU=1; SELECT_PROJECT=2; OP_TYPE=3; CATEGORY=4; AMOUNT=5
     DATE=6; PAY_STATUS=7; CONTRACTOR=8; COMMENT=9
     CP_NAME=20; CP_REVENUE=21; CP_EXPENSE=22
     EDIT_LIST=30
+    IMPORT_FILE=40; IMPORT_CONFIRM=41
+    QUICK_PROJECT=50; QUICK_AMOUNT=51
 
 # ── Categories ────────────────────────────────────────────────────────────────
-EXPENSE_CATS = ['Растения', 'Озеленение', 'Химия и уход', 'Оплата подряду',
-                'Логистика', 'Командировка', 'Расходы на ЗСД', 'Прочее']
+
+EXPENSE_CATS = ['Озеленение', 'Оплата подряду', 'Логистика', 'Строительные',
+                'Командировка', 'Химия и уход', 'ГСМ', 'Расходы на ЗСД', 'Прочее']
 INCOME_CATS  = ['Поступление от клиента', 'Возврат', 'Прочие доходы']
 
+CAT_MAP = {
+    'Логитстика': 'Логистика',
+    'Оплата субподряду': 'Оплата подряду',
+    'Оплата подрядчикам': 'Оплата подряду',
+    'Оплата субподряд': 'Оплата подряду',
+    'Строительство': 'Строительные',
+    'Поступление от клиентов': 'Поступление от клиента',
+    'Поступление от клиента': 'Поступление от клиента',
+    'Растения': 'Озеленение',
+    'Агентское': 'Прочее',
+}
+
+def _norm_cat(cat):
+    if not cat:
+        return 'Прочее'
+    cat = cat.strip()
+    return CAT_MAP.get(cat, cat)
+
 # ── Sheets ────────────────────────────────────────────────────────────────────
+
 _sheets = None
 
 def get_sheets():
     global _sheets
     if _sheets is None:
         b64 = os.environ['GOOGLE_SERVICE_ACCOUNT_B64']
-        sa  = json.loads(base64.b64decode(b64).decode())
+        sa = json.loads(base64.b64decode(b64).decode())
         creds = Credentials.from_service_account_info(
             sa, scopes=['https://www.googleapis.com/auth/spreadsheets'])
         _sheets = gspread.authorize(creds).open_by_key(os.environ['GOOGLE_SHEETS_ID'])
         _ensure_base_sheets(_sheets)
-        _ensure_object_sheets(_sheets)
-        _refresh_dashboard(_sheets)
     return _sheets
 
-def _ws_titles(spreadsheet):
-    return [ws.title for ws in spreadsheet.worksheets()]
+def _ws_titles(sp):
+    return [ws.title for ws in sp.worksheets()]
 
 def _ensure_base_sheets(sp):
     titles = _ws_titles(sp)
@@ -69,175 +112,8 @@ def _ensure_base_sheets(sp):
     if 'Cash Flow' not in titles:
         sp.add_worksheet('Cash Flow', 20, 30)
 
-def _ensure_object_sheets(sp):
-    projects = _get_projects_raw(sp)
-    titles = _ws_titles(sp)
-    for p in projects:
-        if p and p not in titles:
-            _create_object_sheet(sp, p)
-
-def _create_object_sheet(sp, name):
-    try:
-        ws = sp.add_worksheet(name[:50], 200, 10)
-        _update_object_sheet(sp, name, ws)
-        logger.info(f"Created sheet for {name}")
-    except Exception as e:
-        logger.error(f"Error creating sheet for {name}: {e}")
-
-def _update_object_sheet(sp, name, ws=None):
-    try:
-        if ws is None:
-            try:
-                ws = sp.worksheet(name[:50])
-            except:
-                ws = sp.add_worksheet(name[:50], 200, 10)
-
-        ops = _get_operations_raw(sp)
-        p_ops = [o for o in ops if o['project'] == name]
-        _, row = _get_project_row_raw(sp, name)
-
-        plan_revenue = _num(row[4]) if row and len(row) > 4 else 0
-        plan_expense = _num(row[5]) if row and len(row) > 5 else 0
-        plan_profit  = plan_revenue - plan_expense
-        plan_margin  = plan_profit / plan_revenue if plan_revenue > 0 else 0
-
-        fact_income  = sum(o['amount'] for o in p_ops if o['type'] == 'Приход')
-        fact_expense = sum(o['amount'] for o in p_ops if o['type'] == 'Расход')
-        fact_profit  = fact_income - fact_expense
-        fact_margin  = fact_profit / fact_income if fact_income > 0 else 0
-
-        ws.clear()
-        # Header block
-        ws.update('A1:B1', [['Объект:', name]])
-        ws.update('A2:B6', [
-            ['Статус', row[1] if row and len(row)>1 else ''],
-            ['Сумма договора', plan_revenue],
-            ['План расход', plan_expense],
-            ['План прибыль', plan_profit],
-            ['План маржа', round(plan_margin * 100, 1)],
-        ])
-        ws.update('D2:E6', [
-            ['Факт доход', fact_income],
-            ['Факт расход', fact_expense],
-            ['Факт прибыль', fact_profit],
-            ['Факт маржа', round(fact_margin * 100, 1)],
-            ['Откл. прибыль', fact_profit - plan_profit],
-        ])
-        # Operations table
-        ws.update('A8:I8', [['ID','Дата','Тип','Категория','Сумма',
-                              'Контрагент','Статус оплаты','Комментарий','']])
-        if p_ops:
-            rows_data = [[o['id'], o['date'], o['type'], o['category'],
-                          o['amount'], o['contractor'], o['pay_status'], o['comment'], '']
-                         for o in sorted(p_ops, key=lambda x: x['date'], reverse=True)]
-            ws.update(f'A9:I{8+len(rows_data)}', rows_data)
-    except Exception as e:
-        logger.error(f"Error updating sheet {name}: {e}")
-
-def _refresh_dashboard(sp):
-    try:
-        ws = sp.worksheet('Дашборд')
-        ws.clear()
-        projects = _get_projects_raw(sp)
-        ops = _get_operations_raw(sp)
-
-        all_income  = sum(o['amount'] for o in ops if o['type'] == 'Приход')
-        all_expense = sum(o['amount'] for o in ops if o['type'] == 'Расход')
-        all_profit  = all_income - all_expense
-        all_margin  = all_profit / all_income if all_income > 0 else 0
-
-        ws.update('A1', [['ZenScape — Финансовый дашборд']])
-        ws.update('A2:B6', [
-            ['Всего объектов', len(projects)],
-            ['Факт доход', all_income],
-            ['Факт расход', all_expense],
-            ['Факт прибыль', all_profit],
-            ['Факт маржа %', round(all_margin * 100, 1)],
-        ])
-
-        # Per-project table
-        ws.update('A8:K8', [['Объект','Статус','Договор','План расход',
-            'План прибыль','План маржа %','Факт доход','Факт расход',
-            'Факт прибыль','Факт маржа %','Откл. прибыль']])
-
-        obj_ws = sp.worksheet('Объекты')
-        obj_rows = obj_ws.get_all_values()[1:]
-        table = []
-        for r in obj_rows:
-            if not r or not r[0]:
-                continue
-            pname = r[0]
-            p_ops = [o for o in ops if o['project'] == pname]
-            plan_rev = _num(r[4]) if len(r) > 4 else 0
-            plan_exp = _num(r[5]) if len(r) > 5 else 0
-            plan_prf = plan_rev - plan_exp
-            plan_mrg = plan_prf / plan_rev if plan_rev > 0 else 0
-            f_inc = sum(o['amount'] for o in p_ops if o['type'] == 'Приход')
-            f_exp = sum(o['amount'] for o in p_ops if o['type'] == 'Расход')
-            f_prf = f_inc - f_exp
-            f_mrg = f_prf / f_inc if f_inc > 0 else 0
-            table.append([pname, r[1] if len(r)>1 else '',
-                plan_rev, plan_exp, plan_prf, round(plan_mrg*100,1),
-                f_inc, f_exp, f_prf, round(f_mrg*100,1), f_prf - plan_prf])
-        if table:
-            ws.update(f'A9:K{8+len(table)}', table)
-    except Exception as e:
-        logger.error(f"Dashboard refresh error: {e}")
-
-def _refresh_cashflow(sp):
-    try:
-        ws = sp.worksheet('Cash Flow')
-        ws.clear()
-        ops = _get_operations_raw(sp)
-
-        months = []
-        now = datetime.now()
-        for i in range(-3, 9):
-            m = now.month + i
-            y = now.year + (m - 1) // 12
-            m = ((m - 1) % 12) + 1
-            months.append((y, m))
-
-        header = ['Показатель'] + [f"{m:02d}.{y}" for y, m in months]
-        ws.update('A1', [header])
-
-        def month_ops(y, m, t):
-            return sum(o['amount'] for o in ops
-                if o['type'] == t and _parse_date(o['date']) and
-                _parse_date(o['date']).year == y and _parse_date(o['date']).month == m)
-
-        income_row  = ['Приход']
-        expense_row = ['Расход']
-        saldo_row   = ['Сальдо']
-        cumul_row   = ['Накопительно']
-        cumul = 0
-        for y, m in months:
-            inc = month_ops(y, m, 'Приход')
-            exp = month_ops(y, m, 'Расход')
-            sal = inc - exp
-            cumul += sal
-            income_row.append(inc)
-            expense_row.append(exp)
-            saldo_row.append(sal)
-            cumul_row.append(cumul)
-
-        ws.update('A2:A5', [['Приход'], ['Расход'], ['Сальдо'], ['Накопительно']])
-        for i, row in enumerate([income_row, expense_row, saldo_row, cumul_row], 2):
-            ws.update_cell(i, 1, row[0])
-            for j, val in enumerate(row[1:], 2):
-                ws.update_cell(i, j, val)
-    except Exception as e:
-        logger.error(f"Cash flow error: {e}")
-
-def _parse_date(s):
-    for fmt in ('%d.%m.%Y', '%Y-%m-%d'):
-        try:
-            return datetime.strptime(s, fmt)
-        except:
-            pass
-    return None
-
 # ── Raw data helpers ──────────────────────────────────────────────────────────
+
 def _num(val):
     try:
         return float(str(val).replace(' ','').replace(',','.').replace('\xa0','').replace('₽','').strip())
@@ -251,6 +127,14 @@ def _fmt(v):
 def _pct(v):
     try: return f"{float(v)*100:.1f}%"
     except: return "—"
+
+def _parse_date(s):
+    for fmt in ('%d.%m.%Y', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(s, fmt)
+        except:
+            pass
+    return None
 
 def _get_projects_raw(sp):
     try:
@@ -284,7 +168,168 @@ def _get_operations_raw(sp):
     except:
         return []
 
+def _next_op_id(sp):
+    rows = sp.worksheet('Операции').get_all_values()[1:]
+    ids = [int(r[0]) for r in rows if r and r[0] and str(r[0]).isdigit()]
+    return max(ids) + 1 if ids else 1
+
+# ── Object sheet ──────────────────────────────────────────────────────────────
+
+def _create_object_sheet(sp, name):
+    try:
+        ws = sp.add_worksheet(name[:50], 200, 10)
+        _update_object_sheet(sp, name, ws)
+    except Exception as e:
+        logger.error(f"Error creating sheet for {name}: {e}")
+
+def _update_object_sheet(sp, name, ws=None):
+    try:
+        if ws is None:
+            try:
+                ws = sp.worksheet(name[:50])
+            except:
+                ws = sp.add_worksheet(name[:50], 200, 10)
+
+        ops = _get_operations_raw(sp)
+        p_ops = [o for o in ops if o['project'] == name]
+        _, row = _get_project_row_raw(sp, name)
+
+        plan_rev = _num(row[4]) if row and len(row) > 4 else 0
+        plan_exp = _num(row[5]) if row and len(row) > 5 else 0
+        plan_profit = plan_rev - plan_exp
+        plan_margin = plan_profit / plan_rev if plan_rev > 0 else 0
+
+        f_inc = sum(o['amount'] for o in p_ops if o['type'] == 'Приход')
+        f_exp = sum(o['amount'] for o in p_ops if o['type'] == 'Расход')
+        f_profit = f_inc - f_exp
+        f_margin = f_profit / f_inc if f_inc > 0 else 0
+
+        ws.clear()
+        ws.update('A1:B1', [['Объект:', name]])
+        ws.update('A2:B7', [
+            ['Статус', row[1] if row and len(row)>1 else ''],
+            ['Сумма договора', plan_rev],
+            ['План расход', plan_exp],
+            ['План прибыль', plan_profit],
+            ['План маржа %', round(plan_margin * 100, 1)],
+            ['Маржа (мой доход)', f_profit],
+        ])
+        ws.update('D2:E7', [
+            ['Факт доход', f_inc],
+            ['Факт расход', f_exp],
+            ['Факт прибыль', f_profit],
+            ['Факт маржа %', round(f_margin * 100, 1)],
+            ['Откл. прибыль', f_profit - plan_profit],
+            ['', ''],
+        ])
+        ws.update('A9:I9', [['ID','Дата','Тип','Категория','Сумма',
+                              'Контрагент','Статус оплаты','Комментарий','']])
+        if p_ops:
+            rows_data = [[o['id'], o['date'], o['type'], o['category'],
+                          o['amount'], o['contractor'], o['pay_status'], o['comment'], '']
+                         for o in sorted(p_ops, key=lambda x: x['date'], reverse=True)]
+            ws.update(f'A10:I{9+len(rows_data)}', rows_data)
+    except Exception as e:
+        logger.error(f"Error updating sheet {name}: {e}")
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
+def _refresh_dashboard(sp):
+    try:
+        ws = sp.worksheet('Дашборд')
+        ws.clear()
+        projects = _get_projects_raw(sp)
+        ops = _get_operations_raw(sp)
+
+        all_income  = sum(o['amount'] for o in ops if o['type'] == 'Приход')
+        all_expense = sum(o['amount'] for o in ops if o['type'] == 'Расход')
+        all_profit  = all_income - all_expense
+        all_margin  = all_profit / all_income if all_income > 0 else 0
+
+        ws.update('A1', [['ZenScape — Финансовый дашборд']])
+        ws.update('A2:B7', [
+            ['Всего объектов', len(projects)],
+            ['Факт доход', all_income],
+            ['Факт расход', all_expense],
+            ['Факт прибыль', all_profit],
+            ['Факт маржа %', round(all_margin * 100, 1)],
+            ['Маржа (мой доход)', all_profit],
+        ])
+
+        ws.update('A9:L9', [['Объект','Статус','Договор','План расход',
+            'План прибыль','План маржа %','Факт доход','Факт расход',
+            'Факт прибыль','Факт маржа %','Откл. прибыль','Маржа ₽']])
+
+        obj_ws = sp.worksheet('Объекты')
+        obj_rows = obj_ws.get_all_values()[1:]
+        table = []
+        for r in obj_rows:
+            if not r or not r[0]:
+                continue
+            pname = r[0]
+            p_ops = [o for o in ops if o['project'] == pname]
+            plan_rev = _num(r[4]) if len(r) > 4 else 0
+            plan_exp = _num(r[5]) if len(r) > 5 else 0
+            plan_prf = plan_rev - plan_exp
+            plan_mrg = plan_prf / plan_rev if plan_rev > 0 else 0
+            f_inc = sum(o['amount'] for o in p_ops if o['type'] == 'Приход')
+            f_exp = sum(o['amount'] for o in p_ops if o['type'] == 'Расход')
+            f_prf = f_inc - f_exp
+            f_mrg = f_prf / f_inc if f_inc > 0 else 0
+            table.append([pname, r[1] if len(r)>1 else '',
+                plan_rev, plan_exp, plan_prf, round(plan_mrg*100,1),
+                f_inc, f_exp, f_prf, round(f_mrg*100,1), f_prf - plan_prf, f_prf])
+        if table:
+            ws.update(f'A10:L{9+len(table)}', table)
+    except Exception as e:
+        logger.error(f"Dashboard refresh error: {e}")
+
+# ── Cash Flow ─────────────────────────────────────────────────────────────────
+
+def _refresh_cashflow(sp):
+    try:
+        ws = sp.worksheet('Cash Flow')
+        ws.clear()
+        ops = _get_operations_raw(sp)
+
+        months = []
+        now = datetime.now()
+        for i in range(-3, 9):
+            m = now.month + i
+            y = now.year + (m - 1) // 12
+            m = ((m - 1) % 12) + 1
+            months.append((y, m))
+
+        header = ['Показатель'] + [f"{m:02d}.{y}" for y, m in months]
+
+        def month_sum(y, m, t):
+            return sum(o['amount'] for o in ops
+                if o['type'] == t and _parse_date(o['date']) and
+                _parse_date(o['date']).year == y and _parse_date(o['date']).month == m)
+
+        income_row  = ['Приход']
+        expense_row = ['Расход']
+        saldo_row   = ['Сальдо']
+        cumul_row   = ['Накопительно']
+        margin_row  = ['Маржа']
+        cumul = 0
+        for y, m in months:
+            inc = month_sum(y, m, 'Приход')
+            exp = month_sum(y, m, 'Расход')
+            sal = inc - exp
+            cumul += sal
+            income_row.append(inc)
+            expense_row.append(exp)
+            saldo_row.append(sal)
+            cumul_row.append(cumul)
+            margin_row.append(sal)
+
+        ws.update('A1', [header, income_row, expense_row, saldo_row, cumul_row, margin_row])
+    except Exception as e:
+        logger.error(f"Cash flow error: {e}")
+
 # ── Public data functions ─────────────────────────────────────────────────────
+
 def get_projects():
     return _get_projects_raw(get_sheets())
 
@@ -295,21 +340,22 @@ def get_project_summary(project):
     _, row = _get_project_row_raw(sp, project)
     if row is None:
         return None
-    plan_revenue = _num(row[4]) if len(row)>4 else 0
-    plan_expense = _num(row[5]) if len(row)>5 else 0
-    plan_profit  = plan_revenue - plan_expense
-    plan_margin  = plan_profit / plan_revenue if plan_revenue > 0 else 0
-    fact_income  = sum(o['amount'] for o in p_ops if o['type'] == 'Приход')
-    fact_expense = sum(o['amount'] for o in p_ops if o['type'] == 'Расход')
-    fact_profit  = fact_income - fact_expense
-    fact_margin  = fact_profit / fact_income if fact_income > 0 else 0
+    plan_rev = _num(row[4]) if len(row)>4 else 0
+    plan_exp = _num(row[5]) if len(row)>5 else 0
+    plan_profit  = plan_rev - plan_exp
+    plan_margin  = plan_profit / plan_rev if plan_rev > 0 else 0
+    f_inc  = sum(o['amount'] for o in p_ops if o['type'] == 'Приход')
+    f_exp  = sum(o['amount'] for o in p_ops if o['type'] == 'Расход')
+    f_profit  = f_inc - f_exp
+    f_margin  = f_profit / f_inc if f_inc > 0 else 0
     return {
         'name': project, 'status': row[1] if len(row)>1 else '',
-        'plan_revenue': plan_revenue, 'plan_expense': plan_expense,
+        'plan_revenue': plan_rev, 'plan_expense': plan_exp,
         'plan_profit': plan_profit, 'plan_margin': plan_margin,
-        'fact_income': fact_income, 'fact_expense': fact_expense,
-        'fact_profit': fact_profit, 'fact_margin': fact_margin,
-        'dev_profit': fact_profit - plan_profit,
+        'fact_income': f_inc, 'fact_expense': f_exp,
+        'fact_profit': f_profit, 'fact_margin': f_margin,
+        'margin': f_profit,
+        'dev_profit': f_profit - plan_profit,
         'recent_ops': sorted(p_ops, key=lambda x: x['date'], reverse=True)[:5],
     }
 
@@ -317,32 +363,51 @@ def get_all_summary():
     sp = get_sheets()
     ops = _get_operations_raw(sp)
     obj_rows = sp.worksheet('Объекты').get_all_values()[1:]
-    fact_income  = sum(o['amount'] for o in ops if o['type'] == 'Приход')
-    fact_expense = sum(o['amount'] for o in ops if o['type'] == 'Расход')
-    fact_profit  = fact_income - fact_expense
-    fact_margin  = fact_profit / fact_income if fact_income > 0 else 0
-    plan_revenue = sum(_num(r[4]) for r in obj_rows if r and r[0] and len(r)>4)
-    plan_expense = sum(_num(r[5]) for r in obj_rows if r and r[0] and len(r)>5)
-    plan_profit  = plan_revenue - plan_expense
-    plan_margin  = plan_profit / plan_revenue if plan_revenue > 0 else 0
-    return {'fact_income':fact_income,'fact_expense':fact_expense,
-            'fact_profit':fact_profit,'fact_margin':fact_margin,
-            'plan_revenue':plan_revenue,'plan_expense':plan_expense,
-            'plan_profit':plan_profit,'plan_margin':plan_margin,
+    f_inc  = sum(o['amount'] for o in ops if o['type'] == 'Приход')
+    f_exp  = sum(o['amount'] for o in ops if o['type'] == 'Расход')
+    f_profit  = f_inc - f_exp
+    f_margin  = f_profit / f_inc if f_inc > 0 else 0
+    plan_rev = sum(_num(r[4]) for r in obj_rows if r and r[0] and len(r)>4)
+    plan_exp = sum(_num(r[5]) for r in obj_rows if r and r[0] and len(r)>5)
+    plan_profit  = plan_rev - plan_exp
+    plan_margin  = plan_profit / plan_rev if plan_rev > 0 else 0
+    return {'fact_income':f_inc, 'fact_expense':f_exp,
+            'fact_profit':f_profit, 'fact_margin':f_margin,
+            'plan_revenue':plan_rev, 'plan_expense':plan_exp,
+            'plan_profit':plan_profit, 'plan_margin':plan_margin,
+            'margin': f_profit,
             'projects_count':len([r for r in obj_rows if r and r[0]])}
+
+def get_margin_report():
+    sp = get_sheets()
+    ops = _get_operations_raw(sp)
+    obj_rows = sp.worksheet('Объекты').get_all_values()[1:]
+    projects = []
+    total_margin = 0
+    for r in obj_rows:
+        if not r or not r[0]:
+            continue
+        pname = r[0]
+        p_ops = [o for o in ops if o['project'] == pname]
+        f_inc = sum(o['amount'] for o in p_ops if o['type'] == 'Приход')
+        f_exp = sum(o['amount'] for o in p_ops if o['type'] == 'Расход')
+        margin = f_inc - f_exp
+        margin_pct = margin / f_inc if f_inc > 0 else 0
+        total_margin += margin
+        projects.append({'name': pname, 'income': f_inc, 'expense': f_exp,
+                         'margin': margin, 'margin_pct': margin_pct})
+    projects.sort(key=lambda x: x['margin'], reverse=True)
+    return {'total_margin': total_margin, 'projects': projects}
 
 def add_operation(project, op_type, category, amount, date, pay_status, contractor='', comment=''):
     sp = get_sheets()
     ws = sp.worksheet('Операции')
-    rows = ws.get_all_values()[1:]
-    next_id = len([r for r in rows if r and r[0]]) + 1
-    ws.append_row([next_id, date, project, op_type, category,
+    next_id = _next_op_id(sp)
+    ws.append_row([next_id, date, project, op_type, _norm_cat(category),
                    amount, contractor, pay_status, comment])
-    # Update object sheet + dashboard + cashflow
     _update_object_sheet(sp, project)
     _refresh_dashboard(sp)
     _refresh_cashflow(sp)
-    # Budget warning
     warning = None
     _, proj_row = _get_project_row_raw(sp, project)
     if proj_row and op_type == 'Расход':
@@ -352,7 +417,7 @@ def add_operation(project, op_type, category, amount, date, pay_status, contract
             total_exp = sum(o['amount'] for o in ops if o['project']==project and o['type']=='Расход')
             pct = total_exp / plan_exp
             if pct >= 0.8:
-                warning = f"⚠️ Расходы {project}: {round(pct*100,0):.0f}% от плана ({_fmt(total_exp)} / {_fmt(plan_exp)} ₽)"
+                warning = f"⚠️ Расходы {project}: {round(pct*100):.0f}% от плана ({_fmt(total_exp)} / {_fmt(plan_exp)} ₽)"
     return next_id, warning
 
 def create_project(name, revenue, plan_expense):
@@ -386,40 +451,186 @@ def get_recent_ops(project=None, limit=10):
         ops = [o for o in ops if o['project'] == project]
     return sorted(ops, key=lambda x: x['date'], reverse=True)[:limit]
 
+# ── Import from Excel ─────────────────────────────────────────────────────────
+
+def parse_xlsx(path):
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True)
+    result = {'projects': [], 'total_ops': 0}
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        if ws.max_row is None or ws.max_row <= 1:
+            continue
+
+        ops = []
+        contract_value = 0
+
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=12, values_only=False):
+            a = row[0].value if len(row) > 0 else None
+            b = row[1].value if len(row) > 1 else None
+            c = row[2].value if len(row) > 2 else None
+            d = row[3].value if len(row) > 3 else None
+            e = row[4].value if len(row) > 4 else None
+            f = row[5].value if len(row) > 5 else None
+
+            if isinstance(a, datetime) and isinstance(b, (int, float)) and b != 0:
+                op_type = 'Приход' if b > 0 else 'Расход'
+                category = _norm_cat(str(c)) if c else 'Прочее'
+                comment = str(d).strip() if d else ''
+                contractor = str(e).strip() if e else ''
+                if f and isinstance(f, str):
+                    comment = f"{comment} ({f.strip()})" if comment else f.strip()
+                ops.append({
+                    'date': a.strftime('%d.%m.%Y'),
+                    'amount': abs(b),
+                    'type': op_type,
+                    'category': category,
+                    'comment': comment,
+                    'contractor': contractor,
+                })
+
+            for cell in row:
+                if cell.value and isinstance(cell.value, str):
+                    lower = cell.value.lower().strip()
+                    if any(k in lower for k in ('итого', 'договор')):
+                        nc = ws.cell(cell.row, cell.column + 1)
+                        if nc.value and isinstance(nc.value, (int, float)) and nc.value > 0:
+                            contract_value = max(contract_value, nc.value)
+
+        if ops:
+            total_income = sum(o['amount'] for o in ops if o['type'] == 'Приход')
+            total_expense = sum(o['amount'] for o in ops if o['type'] == 'Расход')
+            if contract_value == 0:
+                contract_value = total_income
+
+            result['projects'].append({
+                'name': sheet_name,
+                'ops': ops,
+                'contract_value': contract_value,
+                'plan_expense': total_expense,
+            })
+            result['total_ops'] += len(ops)
+
+    return result
+
+def execute_import(data):
+    sp = get_sheets()
+
+    ws_ops = sp.worksheet('Операции')
+    ws_ops.clear()
+    ws_ops.update('A1:I1', [['ID','Дата','Объект','Тип','Категория',
+        'Сумма','Контрагент','Статус оплаты','Комментарий']])
+
+    ws_obj = sp.worksheet('Объекты')
+    ws_obj.clear()
+    ws_obj.update('A1:J1', [['Название','Статус','Дата начала','Адрес',
+        'Сумма договора','План расход','План прибыль','План маржа %',
+        'Факт доход','Факт расход']])
+
+    titles = _ws_titles(sp)
+    base_sheets = {'Объекты', 'Операции', 'Дашборд', 'Cash Flow'}
+    for title in titles:
+        if title not in base_sheets:
+            try:
+                sp.del_worksheet(sp.worksheet(title))
+            except:
+                pass
+
+    op_id = 1
+    all_ops = []
+
+    for proj in data['projects']:
+        plan_profit = proj['contract_value'] - proj['plan_expense']
+        plan_margin = plan_profit / proj['contract_value'] if proj['contract_value'] > 0 else 0
+        f_inc = sum(o['amount'] for o in proj['ops'] if o['type'] == 'Приход')
+        f_exp = sum(o['amount'] for o in proj['ops'] if o['type'] == 'Расход')
+        ws_obj.append_row([
+            proj['name'], 'Активный', datetime.now().strftime('%d.%m.%Y'), '',
+            proj['contract_value'], proj['plan_expense'],
+            plan_profit, round(plan_margin * 100, 1), f_inc, f_exp
+        ])
+
+        for op in sorted(proj['ops'], key=lambda x: x['date']):
+            all_ops.append([
+                op_id, op['date'], proj['name'], op['type'], op['category'],
+                op['amount'], op['contractor'], 'Оплачено', op['comment']
+            ])
+            op_id += 1
+
+    if all_ops:
+        ws_ops.update(f'A2:I{1+len(all_ops)}', all_ops)
+
+    for proj in data['projects']:
+        _create_object_sheet(sp, proj['name'])
+
+    _refresh_dashboard(sp)
+    _refresh_cashflow(sp)
+
+    return op_id - 1
+
 # ── Keyboards ─────────────────────────────────────────────────────────────────
-def main_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Новая операция", callback_data='op_new')],
-        [InlineKeyboardButton("📊 Общий отчёт", callback_data='report_all'),
-         InlineKeyboardButton("🏢 По объекту", callback_data='report_object')],
-        [InlineKeyboardButton("📁 Создать объект", callback_data='create_project'),
-         InlineKeyboardButton("✏️ Операции", callback_data='edit_ops')],
-        [InlineKeyboardButton("📥 Выгрузить CSV", callback_data='export')],
-    ])
+
+def main_kb(is_admin=True):
+    kb = []
+    if is_admin:
+        kb.append([InlineKeyboardButton("💸 Быстрый расход", callback_data='quick_expense')])
+        kb.append([InlineKeyboardButton("➕ Новая операция", callback_data='op_new')])
+    kb.append([InlineKeyboardButton("💰 Мой доход", callback_data='my_income'),
+               InlineKeyboardButton("📊 Отчёт", callback_data='report_all')])
+    kb.append([InlineKeyboardButton("🏢 По объекту", callback_data='report_object')])
+    if is_admin:
+        kb.append([InlineKeyboardButton("📁 Новый объект", callback_data='create_project'),
+                   InlineKeyboardButton("✏️ Операции", callback_data='edit_ops')])
+        kb.append([InlineKeyboardButton("📥 CSV", callback_data='export'),
+                   InlineKeyboardButton("📤 Импорт xlsx", callback_data='import_start')])
+    return InlineKeyboardMarkup(kb)
 
 def back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]])
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
-@restricted
+
+@any_user
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("🌱 ZenScape — финансовый учёт\n\nЧто хочешь сделать?", reply_markup=main_kb())
+    admin = _is_admin(update)
+    await update.message.reply_text(
+        "🌱 ZenScape — финансовый учёт\n\nЧто хочешь сделать?",
+        reply_markup=main_kb(admin))
     return S.MENU
 
-@restricted
+@any_user
 async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     d = q.data
+    admin = _is_admin(update)
 
+    # ── Back to menu ──
     if d == 'back_to_menu':
         context.user_data.clear()
-        await q.edit_message_text("Что хочешь сделать?", reply_markup=main_kb())
+        await q.edit_message_text("Что хочешь сделать?", reply_markup=main_kb(admin))
         return S.MENU
 
+    # ── Quick expense ──
+    if d == 'quick_expense' and admin:
+        projects = get_projects()
+        if not projects:
+            await q.edit_message_text("Нет объектов. Создай объект сначала.", reply_markup=back_kb())
+            return S.MENU
+        kb = [[InlineKeyboardButton(p, callback_data=f'qp_{p}')] for p in projects]
+        kb.append([InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')])
+        await q.edit_message_text("💸 Быстрый расход\n\nВыбери объект:", reply_markup=InlineKeyboardMarkup(kb))
+        return S.QUICK_PROJECT
+
+    if d.startswith('qp_'):
+        context.user_data['project'] = d[3:]
+        await q.edit_message_text(f"💸 {context.user_data['project']}\n\nСумма расхода (₽):")
+        return S.QUICK_AMOUNT
+
     # ── New operation ──
-    if d == 'op_new':
+    if d == 'op_new' and admin:
         projects = get_projects()
         if not projects:
             await q.edit_message_text("Нет объектов. Создай объект сначала.", reply_markup=back_kb())
@@ -444,6 +655,7 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['op_type'] = d[5:]
         cats = INCOME_CATS if d[5:] == 'Приход' else EXPENSE_CATS
         kb = [[InlineKeyboardButton(c, callback_data=f'cat_{c}')] for c in cats]
+        kb.append([InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')])
         await q.edit_message_text(f"Категория ({d[5:]}):", reply_markup=InlineKeyboardMarkup(kb))
         return S.CATEGORY
 
@@ -478,6 +690,23 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['comment'] = ''
         return await _save_op_q(q, context)
 
+    # ── My income (margin) ──
+    if d == 'my_income':
+        report = get_margin_report()
+        text = f"💰 <b>Мой доход</b>\n\n"
+        text += f"На руках: <b>{_fmt(report['total_margin'])} ₽</b>\n\n"
+        for p in report['projects']:
+            sign = "+" if p['margin'] >= 0 else ""
+            emoji = "🟢" if p['margin'] > 0 else "🔴"
+            text += f"{emoji} <b>{p['name']}</b>\n"
+            text += f"   {sign}{_fmt(p['margin'])} ₽"
+            if p['margin_pct'] != 0:
+                text += f" (маржа {_pct(p['margin_pct'])})"
+            text += "\n"
+            text += f"   ↳ доход {_fmt(p['income'])} / расход {_fmt(p['expense'])} ₽\n\n"
+        await q.edit_message_text(text, reply_markup=back_kb(), parse_mode=ParseMode.HTML)
+        return S.MENU
+
     # ── Reports ──
     if d == 'report_all':
         s = get_all_summary()
@@ -486,7 +715,8 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 Доход: {_fmt(s['fact_income'])} ₽\n"
                 f"💸 Расход: {_fmt(s['fact_expense'])} ₽\n"
                 f"📈 Прибыль: {_fmt(s['fact_profit'])} ₽\n"
-                f"📊 Маржа: {_pct(s['fact_margin'])}\n\n"
+                f"📊 Маржа: {_pct(s['fact_margin'])}\n"
+                f"💰 Мой доход: <b>{_fmt(s['margin'])} ₽</b>\n\n"
                 f"<b>ПЛАН:</b>\n"
                 f"💰 Выручка: {_fmt(s['plan_revenue'])} ₽\n"
                 f"💸 Расход: {_fmt(s['plan_expense'])} ₽\n"
@@ -507,7 +737,9 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not s:
             await q.edit_message_text("Объект не найден.", reply_markup=back_kb())
             return S.MENU
+        sign = "+" if s['margin'] >= 0 else ""
         text = (f"📊 <b>{s['name']}</b> ({s['status']})\n\n"
+                f"💰 <b>Маржа (мой доход): {sign}{_fmt(s['margin'])} ₽ ({_pct(s['fact_margin'])})</b>\n\n"
                 f"<b>ПЛАН:</b>\n"
                 f"💰 Договор: {_fmt(s['plan_revenue'])} ₽\n"
                 f"💸 Расход: {_fmt(s['plan_expense'])} ₽\n"
@@ -522,18 +754,18 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if s['recent_ops']:
             text += "\n<b>Последние операции:</b>\n"
             for o in s['recent_ops']:
-                sign = "+" if o['type'] == 'Приход' else "-"
-                text += f"  {o['date']}  {sign}{_fmt(o['amount'])} ₽  {o['category']}\n"
+                sign_op = "+" if o['type'] == 'Приход' else "-"
+                text += f"  {o['date']}  {sign_op}{_fmt(o['amount'])} ₽  {o['category']}\n"
         await q.edit_message_text(text, reply_markup=back_kb(), parse_mode=ParseMode.HTML)
         return S.MENU
 
     # ── Create project ──
-    if d == 'create_project':
+    if d == 'create_project' and admin:
         await q.edit_message_text("Название нового объекта:")
         return S.CP_NAME
 
     # ── Edit operations ──
-    if d == 'edit_ops':
+    if d == 'edit_ops' and admin:
         ops = get_recent_ops(limit=10)
         if not ops:
             await q.edit_message_text("Операций нет.", reply_markup=back_kb())
@@ -547,7 +779,7 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Нажми 🗑 для удаления:", reply_markup=InlineKeyboardMarkup(kb))
         return S.EDIT_LIST
 
-    if d.startswith('del_'):
+    if d.startswith('del_') and admin:
         if delete_operation(d[4:]):
             await q.answer("✅ Удалено", show_alert=True)
         else:
@@ -566,7 +798,7 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S.EDIT_LIST
 
     # ── Export ──
-    if d == 'export':
+    if d == 'export' and admin:
         projects = get_projects()
         kb = [[InlineKeyboardButton("📦 Все объекты", callback_data='exp_all')]]
         kb += [[InlineKeyboardButton(p, callback_data=f'expp_{p}')] for p in projects]
@@ -589,6 +821,41 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fname = f"zenscape_{project or 'all'}.csv"
         await q.message.reply_document(document=bio, filename=fname, caption="✅ Готово")
         await q.edit_message_text("✅ Файл отправлен.", reply_markup=back_kb())
+        return S.MENU
+
+    # ── Import start ──
+    if d == 'import_start' and admin:
+        await q.edit_message_text(
+            "📤 <b>Импорт из Excel</b>\n\n"
+            "Отправь файл .xlsx с данными.\n\n"
+            "Каждый лист = один объект.\n"
+            "Столбцы: Дата | Сумма | Статья | Описание | Контрагент\n\n"
+            "⚠️ Текущие данные будут заменены!",
+            parse_mode=ParseMode.HTML, reply_markup=back_kb())
+        return S.IMPORT_FILE
+
+    if d == 'import_yes':
+        data = context.user_data.get('import_data')
+        if not data:
+            await q.edit_message_text("❌ Нет данных для импорта.", reply_markup=back_kb())
+            return S.MENU
+        try:
+            total = execute_import(data)
+            await q.edit_message_text(
+                f"✅ Импорт завершён!\n\n"
+                f"📁 Объектов: {len(data['projects'])}\n"
+                f"📝 Операций: {total}\n\n"
+                f"Дашборд и листы объектов обновлены.",
+                reply_markup=main_kb(admin))
+            context.user_data.clear()
+        except Exception as e:
+            logger.error(f"Import error: {e}")
+            await q.edit_message_text(f"❌ Ошибка импорта: {e}", reply_markup=back_kb())
+        return S.MENU
+
+    if d == 'import_no':
+        context.user_data.clear()
+        await q.edit_message_text("Импорт отменён.", reply_markup=main_kb(admin))
         return S.MENU
 
     return S.MENU
@@ -619,8 +886,9 @@ async def _save_op_q(q, context):
             f"💳 {context.user_data.get('pay_status','')}")
     if warning:
         text += f"\n\n{warning}"
+    admin = q.from_user.id in ADMIN_USERS
     context.user_data.clear()
-    await q.edit_message_text(text, reply_markup=main_kb())
+    await q.edit_message_text(text, reply_markup=main_kb(admin))
     return S.MENU
 
 async def _save_op_msg(update, context):
@@ -639,12 +907,31 @@ async def _save_op_msg(update, context):
             f"💳 {context.user_data.get('pay_status','')}")
     if warning:
         text += f"\n\n{warning}"
+    admin = update.effective_user.id in ADMIN_USERS
     context.user_data.clear()
-    await update.message.reply_text(text, reply_markup=main_kb())
+    await update.message.reply_text(text, reply_markup=main_kb(admin))
     return S.MENU
 
 # ── Text input handlers ───────────────────────────────────────────────────────
-@restricted
+
+@admin_only
+async def quick_amount_handler(update, context):
+    try:
+        amount = float(update.message.text.strip().replace(',','.').replace(' ',''))
+        op_id, warning = add_operation(
+            context.user_data['project'], 'Расход', 'Прочее', amount,
+            datetime.now().strftime('%d.%m.%Y'), 'Оплачено')
+        text = f"✅ Расход записан!\n\n📍 {context.user_data['project']}\n💸 {_fmt(amount)} ₽"
+        if warning:
+            text += f"\n\n{warning}"
+        context.user_data.clear()
+        await update.message.reply_text(text, reply_markup=main_kb(True))
+        return S.MENU
+    except ValueError:
+        await update.message.reply_text("❌ Введи число, например: 15000")
+        return S.QUICK_AMOUNT
+
+@admin_only
 async def amount_handler(update, context):
     try:
         context.user_data['amount'] = float(update.message.text.strip().replace(',','.').replace(' ',''))
@@ -660,7 +947,7 @@ async def amount_handler(update, context):
         await update.message.reply_text("❌ Введи число, например: 15000")
         return S.AMOUNT
 
-@restricted
+@admin_only
 async def date_text_handler(update, context):
     try:
         datetime.strptime(update.message.text.strip(), '%d.%m.%Y')
@@ -677,19 +964,19 @@ async def date_text_handler(update, context):
         await update.message.reply_text("❌ Формат: ДД.ММ.ГГГГ")
         return S.DATE
 
-@restricted
+@admin_only
 async def contractor_handler(update, context):
     context.user_data['contractor'] = update.message.text.strip()
     await update.message.reply_text("Комментарий:",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Пропустить", callback_data='skip_comment')]]))
     return S.COMMENT
 
-@restricted
+@admin_only
 async def comment_handler(update, context):
     context.user_data['comment'] = update.message.text.strip()
     return await _save_op_msg(update, context)
 
-@restricted
+@admin_only
 async def cp_name_handler(update, context):
     context.user_data['cp_name'] = update.message.text.strip()
     await update.message.reply_text(
@@ -697,7 +984,7 @@ async def cp_name_handler(update, context):
         parse_mode=ParseMode.HTML)
     return S.CP_REVENUE
 
-@restricted
+@admin_only
 async def cp_revenue_handler(update, context):
     try:
         context.user_data['cp_revenue'] = float(update.message.text.strip().replace(',','.').replace(' ',''))
@@ -709,7 +996,7 @@ async def cp_revenue_handler(update, context):
         await update.message.reply_text("❌ Введи число")
         return S.CP_REVENUE
 
-@restricted
+@admin_only
 async def cp_expense_handler(update, context):
     try:
         expense = float(update.message.text.strip().replace(',','.').replace(' ',''))
@@ -726,20 +1013,68 @@ async def cp_expense_handler(update, context):
             f"📈 Прибыль: {_fmt(profit)} ₽\n"
             f"📊 Маржа: {_pct(margin)}\n\n"
             f"Вкладка в таблице создана автоматически.",
-            reply_markup=main_kb())
+            reply_markup=main_kb(True))
         context.user_data.clear()
         return S.MENU
     except ValueError:
         await update.message.reply_text("❌ Введи число")
         return S.CP_EXPENSE
 
-@restricted
+@admin_only
+async def import_file_handler(update, context):
+    doc = update.message.document
+    if not doc or not doc.file_name.endswith('.xlsx'):
+        await update.message.reply_text("❌ Отправь файл .xlsx", reply_markup=back_kb())
+        return S.IMPORT_FILE
+
+    await update.message.reply_text("⏳ Обрабатываю файл...")
+
+    try:
+        file = await doc.get_file()
+        with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            data = parse_xlsx(tmp.name)
+            os.unlink(tmp.name)
+    except Exception as e:
+        logger.error(f"Import parse error: {e}")
+        await update.message.reply_text(f"❌ Ошибка чтения файла: {e}", reply_markup=back_kb())
+        return S.MENU
+
+    if not data['projects']:
+        await update.message.reply_text("❌ Не найдено данных для импорта.", reply_markup=back_kb())
+        return S.MENU
+
+    context.user_data['import_data'] = data
+
+    text = f"📤 <b>Найдено для импорта:</b>\n\n"
+    for p in data['projects']:
+        inc = sum(o['amount'] for o in p['ops'] if o['type'] == 'Приход')
+        exp = sum(o['amount'] for o in p['ops'] if o['type'] == 'Расход')
+        text += f"📍 <b>{p['name']}</b>\n"
+        text += f"   Операций: {len(p['ops'])}\n"
+        text += f"   Доход: {_fmt(inc)} ₽ | Расход: {_fmt(exp)} ₽\n"
+        if p['contract_value']:
+            text += f"   Договор: {_fmt(p['contract_value'])} ₽\n"
+        text += "\n"
+    text += f"📝 Всего операций: {data['total_ops']}\n\n"
+    text += "⚠️ <b>Текущие данные будут УДАЛЕНЫ.</b>\nПродолжить?"
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, импортировать", callback_data='import_yes')],
+            [InlineKeyboardButton("❌ Отмена", callback_data='import_no')],
+        ]))
+    return S.IMPORT_CONFIRM
+
+@any_user
 async def cancel(update, context):
     context.user_data.clear()
-    await update.message.reply_text("Отменено.", reply_markup=main_kb())
+    admin = _is_admin(update)
+    await update.message.reply_text("Отменено.", reply_markup=main_kb(admin))
     return S.MENU
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     app = Application.builder().token(os.environ['TELEGRAM_BOT_TOKEN']).build()
     conv = ConversationHandler(
@@ -761,6 +1096,11 @@ def main():
             S.CP_REVENUE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, cp_revenue_handler)],
             S.CP_EXPENSE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, cp_expense_handler)],
             S.EDIT_LIST:      [CallbackQueryHandler(menu_cb)],
+            S.IMPORT_FILE:    [MessageHandler(filters.Document.ALL, import_file_handler),
+                               CallbackQueryHandler(menu_cb, pattern='^back_to_menu$')],
+            S.IMPORT_CONFIRM: [CallbackQueryHandler(menu_cb)],
+            S.QUICK_PROJECT:  [CallbackQueryHandler(menu_cb)],
+            S.QUICK_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, quick_amount_handler)],
         },
         fallbacks=[CommandHandler('cancel', cancel), CommandHandler('start', start)],
     )
