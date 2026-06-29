@@ -356,7 +356,7 @@ def get_project_summary(project):
         'fact_profit': f_profit, 'fact_margin': f_margin,
         'margin': f_profit,
         'dev_profit': f_profit - plan_profit,
-        'recent_ops': sorted(p_ops, key=lambda x: x['date'], reverse=True)[:5],
+        'recent_ops': sorted(p_ops, key=lambda x: _parse_date(x['date']) or datetime.min, reverse=True),
     }
 
 def get_all_summary():
@@ -584,10 +584,59 @@ def main_kb(is_admin=True):
                    InlineKeyboardButton("✏️ Операции", callback_data='edit_ops')])
         kb.append([InlineKeyboardButton("📥 CSV", callback_data='export'),
                    InlineKeyboardButton("📤 Импорт xlsx", callback_data='import_start')])
+    sheets_url = _sheets_url()
+    if sheets_url:
+        kb.append([InlineKeyboardButton("📋 Google Таблица", url=sheets_url)])
     return InlineKeyboardMarkup(kb)
 
 def back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]])
+
+OPS_PAGE_SIZE = 8
+
+def _sheets_url():
+    sid = os.environ.get('GOOGLE_SHEETS_ID', '')
+    return f"https://docs.google.com/spreadsheets/d/{sid}" if sid else None
+
+async def _show_object_report(q, context, s, page=0):
+    sign = "+" if s['margin'] >= 0 else ""
+    text = (f"📊 <b>{s['name']}</b> ({s['status']})\n\n"
+            f"💰 <b>Маржа (мой доход): {sign}{_fmt(s['margin'])} ₽ ({_pct(s['fact_margin'])})</b>\n\n"
+            f"<b>ПЛАН:</b>\n"
+            f"💰 Договор: {_fmt(s['plan_revenue'])} ₽\n"
+            f"💸 Расход: {_fmt(s['plan_expense'])} ₽\n"
+            f"📈 Прибыль: {_fmt(s['plan_profit'])} ₽\n"
+            f"📊 Маржа: {_pct(s['plan_margin'])}\n\n"
+            f"<b>ФАКТ:</b>\n"
+            f"💰 Доход: {_fmt(s['fact_income'])} ₽\n"
+            f"💸 Расход: {_fmt(s['fact_expense'])} ₽\n"
+            f"📈 Прибыль: {_fmt(s['fact_profit'])} ₽\n"
+            f"📊 Маржа: {_pct(s['fact_margin'])}\n\n"
+            f"📉 Откл.: {_fmt(s['dev_profit'])} ₽\n")
+
+    ops = s['recent_ops']
+    total_pages = max(1, (len(ops) + OPS_PAGE_SIZE - 1) // OPS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = ops[page * OPS_PAGE_SIZE : (page + 1) * OPS_PAGE_SIZE]
+
+    if ops:
+        text += f"\n<b>Операции (стр. {page + 1}/{total_pages}):</b>\n"
+        for o in chunk:
+            sign_op = "+" if o['type'] == 'Приход' else "-"
+            text += f"  {o['date']}  {sign_op}{_fmt(o['amount'])} ₽  {o['category']}\n"
+
+    kb = []
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Пред", callback_data=f"rptpg_{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("След ▶", callback_data=f"rptpg_{page + 1}"))
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')])
+
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
@@ -611,6 +660,9 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if d == 'back_to_menu':
         context.user_data.clear()
         await q.edit_message_text("Что хочешь сделать?", reply_markup=main_kb(admin))
+        return S.MENU
+
+    if d == 'noop':
         return S.MENU
 
     # ── Quick expense ──
@@ -733,30 +785,25 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S.MENU
 
     if d.startswith('rpt_'):
-        s = get_project_summary(d[4:])
+        project = d[4:]
+        s = get_project_summary(project)
         if not s:
             await q.edit_message_text("Объект не найден.", reply_markup=back_kb())
             return S.MENU
-        sign = "+" if s['margin'] >= 0 else ""
-        text = (f"📊 <b>{s['name']}</b> ({s['status']})\n\n"
-                f"💰 <b>Маржа (мой доход): {sign}{_fmt(s['margin'])} ₽ ({_pct(s['fact_margin'])})</b>\n\n"
-                f"<b>ПЛАН:</b>\n"
-                f"💰 Договор: {_fmt(s['plan_revenue'])} ₽\n"
-                f"💸 Расход: {_fmt(s['plan_expense'])} ₽\n"
-                f"📈 Прибыль: {_fmt(s['plan_profit'])} ₽\n"
-                f"📊 Маржа: {_pct(s['plan_margin'])}\n\n"
-                f"<b>ФАКТ:</b>\n"
-                f"💰 Доход: {_fmt(s['fact_income'])} ₽\n"
-                f"💸 Расход: {_fmt(s['fact_expense'])} ₽\n"
-                f"📈 Прибыль: {_fmt(s['fact_profit'])} ₽\n"
-                f"📊 Маржа: {_pct(s['fact_margin'])}\n\n"
-                f"📉 Откл.: {_fmt(s['dev_profit'])} ₽\n")
-        if s['recent_ops']:
-            text += "\n<b>Последние операции:</b>\n"
-            for o in s['recent_ops']:
-                sign_op = "+" if o['type'] == 'Приход' else "-"
-                text += f"  {o['date']}  {sign_op}{_fmt(o['amount'])} ₽  {o['category']}\n"
-        await q.edit_message_text(text, reply_markup=back_kb(), parse_mode=ParseMode.HTML)
+        context.user_data['report_project'] = project
+        context.user_data['report_ops'] = s['recent_ops']
+        await _show_object_report(q, context, s, page=0)
+        return S.MENU
+
+    if d.startswith('rptpg_'):
+        page = int(d[6:])
+        project = context.user_data.get('report_project')
+        s = get_project_summary(project) if project else None
+        if not s:
+            await q.edit_message_text("Объект не найден.", reply_markup=back_kb())
+            return S.MENU
+        context.user_data['report_ops'] = s['recent_ops']
+        await _show_object_report(q, context, s, page=page)
         return S.MENU
 
     # ── Create project ──
