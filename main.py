@@ -112,6 +112,107 @@ def _ensure_base_sheets(sp):
     if 'Cash Flow' not in titles:
         sp.add_worksheet('Cash Flow', 20, 30)
 
+# ── Supabase mirror ───────────────────────────────────────────────────────────
+# Дублируем записи в облачную БД ZenScape (единый источник для приложения).
+# Если переменные окружения не заданы — тихо пропускаем, бот работает как раньше.
+
+import requests as _rq
+
+SB_URL = os.environ.get('SUPABASE_URL', '').rstrip('/')
+SB_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
+
+# Категории бота → статьи приложения ZenScape
+SB_ARTICLE_MAP = {
+    'Поступление от клиента': ('income.client',      'Доходы'),
+    'Возврат':                ('income.refund',      'Возврат доходы'),
+    'Прочие доходы':          ('income.other',       'Доходы'),
+    'Озеленение':             ('direct.planting',    'Прямые расходы'),
+    'Строительные':           ('direct.construction','Прямые расходы'),
+    'Оплата подряду':         ('direct.cost',        'Прямые расходы'),
+    'Логистика':              ('direct.project',     'Прямые расходы'),
+    'Командировка':           ('travel.fare',        'Командировки'),
+    'Химия и уход':           ('direct.maintenance', 'Прямые расходы'),
+    'ГСМ':                    ('transport.fuel',     'Транспорт'),
+    'Расходы на ЗСД':         ('transport.zsd',      'Транспорт'),
+    'Прочее':                 ('overhead.other',     'Общехозяйственные'),
+}
+
+def _sb_enabled():
+    return bool(SB_URL and SB_KEY)
+
+def _sb_headers():
+    return {'apikey': SB_KEY, 'Authorization': f'Bearer {SB_KEY}',
+            'Content-Type': 'application/json', 'Prefer': 'return=representation'}
+
+def _sb_project_id(name):
+    try:
+        r = _rq.get(f'{SB_URL}/rest/v1/projects', headers=_sb_headers(),
+                    params={'name': f'eq.{name}', 'select': 'id'}, timeout=10)
+        rows = r.json()
+        return rows[0]['id'] if rows else None
+    except Exception as e:
+        logger.warning(f'Supabase project lookup failed: {e}')
+        return None
+
+def _sb_date(d):
+    try:
+        return datetime.strptime(d, '%d.%m.%Y').strftime('%Y-%m-%d')
+    except Exception:
+        return d
+
+def sb_mirror_operation(op_id, project, op_type, category, amount, date, pay_status, contractor='', comment=''):
+    if not _sb_enabled():
+        return
+    try:
+        pid = _sb_project_id(project)
+        if not pid:
+            logger.warning(f'Supabase: объект «{project}» не найден, операция {op_id} не зеркалирована')
+            return
+        cat = _norm_cat(category)
+        article, group = SB_ARTICLE_MAP.get(cat, ('overhead.other', 'Общехозяйственные'))
+        if op_type == 'Приход' and not article.startswith('income.'):
+            article, group = 'income.client', 'Доходы'
+        s = abs(float(amount))
+        if op_type == 'Расход':
+            s = -s
+        purpose = comment or ''
+        if article in ('direct.cost', 'direct.project', 'overhead.other') and cat not in ('Прочее',):
+            purpose = f'[{cat}] {purpose}'.strip()
+        _rq.post(f'{SB_URL}/rest/v1/expenses', headers=_sb_headers(), timeout=10, json={
+            'project_id': pid, 'date': _sb_date(date), 'sum': s,
+            'article': article, 'article_group': group,
+            'purpose': purpose, 'counterparty': contractor or '',
+            'plan_fact': 'plan' if pay_status == 'Ожидает' else 'fact',
+            'sort_order': int(op_id),
+        })
+    except Exception as e:
+        logger.warning(f'Supabase mirror add failed: {e}')
+
+def sb_mirror_project(name, revenue):
+    if not _sb_enabled():
+        return
+    try:
+        r = _rq.get(f'{SB_URL}/rest/v1/studios', headers=_sb_headers(),
+                    params={'select': 'id', 'limit': '1'}, timeout=10)
+        studios = r.json()
+        if not studios:
+            return
+        _rq.post(f'{SB_URL}/rest/v1/projects', headers=_sb_headers(), timeout=10, json={
+            'studio_id': studios[0]['id'], 'name': name, 'status': 'in_progress',
+            'total_budget': revenue, 'started_at': datetime.now().strftime('%Y-%m-%d'),
+        })
+    except Exception as e:
+        logger.warning(f'Supabase mirror project failed: {e}')
+
+def sb_mirror_delete(op_id):
+    if not _sb_enabled():
+        return
+    try:
+        _rq.delete(f'{SB_URL}/rest/v1/expenses', headers=_sb_headers(),
+                   params={'sort_order': f'eq.{op_id}'}, timeout=10)
+    except Exception as e:
+        logger.warning(f'Supabase mirror delete failed: {e}')
+
 # ── Raw data helpers ──────────────────────────────────────────────────────────
 
 def _num(val):
@@ -405,6 +506,7 @@ def add_operation(project, op_type, category, amount, date, pay_status, contract
     next_id = _next_op_id(sp)
     ws.append_row([next_id, date, project, op_type, _norm_cat(category),
                    amount, contractor, pay_status, comment])
+    sb_mirror_operation(next_id, project, op_type, category, amount, date, pay_status, contractor, comment)
     _update_object_sheet(sp, project)
     _refresh_dashboard(sp)
     _refresh_cashflow(sp)
@@ -427,6 +529,7 @@ def create_project(name, revenue, plan_expense):
     sp.worksheet('Объекты').append_row([
         name, 'Активный', datetime.now().strftime('%d.%m.%Y'), '',
         revenue, plan_expense, plan_profit, round(plan_margin*100, 1), 0, 0])
+    sb_mirror_project(name, revenue)
     _create_object_sheet(sp, name)
     _refresh_dashboard(sp)
 
@@ -438,6 +541,7 @@ def delete_operation(op_id):
         if row and str(row[0]) == str(op_id):
             project = row[2] if len(row) > 2 else None
             ws.delete_rows(i)
+            sb_mirror_delete(op_id)
             if project:
                 _update_object_sheet(sp, project)
                 _refresh_dashboard(sp)
