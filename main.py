@@ -213,6 +213,118 @@ def sb_mirror_delete(op_id):
     except Exception as e:
         logger.warning(f'Supabase mirror delete failed: {e}')
 
+# ── Обратная синхронизация: облако → Google Sheets ────────────────────────────
+# Раз в 3 минуты подтягиваем то, что появилось в облаке с сайта:
+#   • новые объекты (проекты) → лист «Объекты»
+#   • новые операции (sort_order = 0) → лист «Операции» с присвоением ID
+
+# Статьи приложения → категории бота
+SB_ARTICLE_REVERSE = {
+    'income.client':      ('Приход', 'Поступление от клиента'),
+    'income.refund':      ('Приход', 'Возврат'),
+    'income.other':       ('Приход', 'Прочие доходы'),
+    'income.agent':       ('Приход', 'Прочие доходы'),
+    'income.purchases':   ('Приход', 'Прочие доходы'),
+    'income.supervision': ('Приход', 'Прочие доходы'),
+    'income.adjust':      ('Приход', 'Прочие доходы'),
+    'direct.planting':    ('Расход', 'Озеленение'),
+    'direct.construction':('Расход', 'Строительные'),
+    'direct.cost':        ('Расход', 'Оплата подряду'),
+    'direct.project':     ('Расход', 'Логистика'),
+    'direct.maintenance': ('Расход', 'Химия и уход'),
+    'travel.fare':        ('Расход', 'Командировка'),
+    'transport.fuel':     ('Расход', 'ГСМ'),
+    'transport.zsd':      ('Расход', 'Расходы на ЗСД'),
+}
+
+def _sheet_date(iso):
+    try:
+        return datetime.strptime(str(iso)[:10], '%Y-%m-%d').strftime('%d.%m.%Y')
+    except Exception:
+        return str(iso)
+
+def sync_from_supabase():
+    """Однократный проход синхронизации облако → Sheets."""
+    if not _sb_enabled():
+        return
+    sp = get_sheets()
+
+    # 1. Новые объекты
+    r = _rq.get(f'{SB_URL}/rest/v1/projects', headers=_sb_headers(),
+                params={'select': 'id,name,status,total_budget,started_at'}, timeout=15)
+    cloud_projects = r.json() if r.ok else []
+    ws_obj = sp.worksheet('Объекты')
+    sheet_names = {row[0].strip() for row in ws_obj.get_all_values()[1:] if row and row[0]}
+    added_projects = []
+    for cp in cloud_projects:
+        name = (cp.get('name') or '').strip()
+        if not name or name in sheet_names:
+            continue
+        budget = float(cp.get('total_budget') or 0)
+        ws_obj.append_row([name, 'Активный',
+                           _sheet_date(cp.get('started_at') or datetime.now().strftime('%Y-%m-%d')),
+                           '', budget, 0, budget, 100.0 if budget else 0, 0, 0])
+        _create_object_sheet(sp, name)
+        added_projects.append(name)
+        logger.info(f'Sync: новый объект с сайта → Sheets: {name}')
+
+    # 2. Новые операции с сайта (sort_order = 0)
+    r = _rq.get(f'{SB_URL}/rest/v1/expenses', headers=_sb_headers(),
+                params={'select': 'id,project_id,date,sum,article,purpose,counterparty,plan_fact',
+                        'sort_order': 'eq.0', 'order': 'created_at.asc'}, timeout=15)
+    site_ops = r.json() if r.ok else []
+    if not site_ops and not added_projects:
+        return
+
+    proj_name = {p['id']: p['name'] for p in cloud_projects}
+    ws_ops = sp.worksheet('Операции')
+    touched = set(added_projects)
+    for op in site_ops:
+        pname = proj_name.get(op.get('project_id'))
+        if not pname:
+            continue
+        s = float(op.get('sum') or 0)
+        op_type, category = SB_ARTICLE_REVERSE.get(
+            op.get('article') or '',
+            ('Приход', 'Прочие доходы') if s > 0 else ('Расход', 'Прочее'))
+        next_id = _next_op_id(sp)
+        ws_ops.append_row([next_id, _sheet_date(op.get('date')), pname, op_type,
+                           category, abs(s), op.get('counterparty') or '',
+                           'Ожидает' if op.get('plan_fact') == 'plan' else 'Оплачено',
+                           op.get('purpose') or ''])
+        _rq.patch(f'{SB_URL}/rest/v1/expenses', headers=_sb_headers(),
+                  params={'id': f"eq.{op['id']}"},
+                  json={'sort_order': next_id}, timeout=10)
+        touched.add(pname)
+        logger.info(f'Sync: операция с сайта → Sheets: #{next_id} {pname} {s}')
+
+    for pname in touched:
+        try:
+            _update_object_sheet(sp, pname)
+        except Exception as e:
+            logger.warning(f'Sync: object sheet {pname}: {e}')
+    if touched:
+        _refresh_dashboard(sp)
+        _refresh_cashflow(sp)
+
+def _sync_loop():
+    import time as _time
+    _time.sleep(30)  # даём боту стартовать
+    while True:
+        try:
+            sync_from_supabase()
+        except Exception as e:
+            logger.warning(f'Sync loop error: {e}')
+        _time.sleep(180)
+
+def start_sync_thread():
+    if not _sb_enabled():
+        logger.info('Sync: SUPABASE_URL/KEY не заданы — фоновая синхронизация выключена')
+        return
+    import threading
+    threading.Thread(target=_sync_loop, daemon=True, name='sb-sync').start()
+    logger.info('Sync: фоновая синхронизация облако → Sheets запущена (каждые 3 мин)')
+
 # ── Raw data helpers ──────────────────────────────────────────────────────────
 
 def _num(val):
@@ -1256,6 +1368,7 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel), CommandHandler('start', start)],
     )
     app.add_handler(conv)
+    start_sync_thread()
     app.run_polling()
 
 if __name__ == '__main__':
