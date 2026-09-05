@@ -1,3 +1,4 @@
 state/
 dist/
 __pycache__/
+.env
