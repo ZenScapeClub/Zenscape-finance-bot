@@ -301,7 +301,7 @@ function renderHome(){
   <div class="quick">
     <button data-go="days" data-day="${cur.n}"><b>${today>=m.start&&today<=m.end?'Сегодня':'Ближайший день'}: день ${cur.n}</b><span>${esc(fmtD(cur.date))} · ${esc(cur.place)}</span></button>
     <button data-go="info" data-open="birthday"><b>День рождения</b><span>${esc(fmtD(m.birthday))} · ${top?esc(top.name):'варианты'}</span></button>
-    <button data-go="info" data-open="flights"><b>Билеты</b><span>${flRec?esc(flRec.price||flRec.route||''):'варианты'}</span></button>
+    <button data-go="info" data-open="flights"><b>Билеты</b><span>${flRec?esc((flRec.price||flRec.route||'').split(';')[0]):'варианты'}</span></button>
     <button data-go="info" data-open="visa"><b>Виза</b><span>${esc((TRIP.visa&&TRIP.visa.short)||'РФ и РБ — по шагам')}</span></button>
   </div>
   <div class="card">
